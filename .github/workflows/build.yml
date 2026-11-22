@@ -5,6 +5,9 @@ on:
   push:
     branches: [main, master]
 
+permissions:
+  contents: write
+
 jobs:
   build:
     runs-on: ubuntu-latest
@@ -27,19 +30,9 @@ jobs:
           SETTINGS=$(find work -name settings.gradle.kts | head -n 1)
           echo "PROJECT_DIR=$(dirname "$SETTINGS")" >> $GITHUB_ENV
 
-      - name: Create debug keystore
+      - name: Create debug keystore (solo si el proyecto no trae una)
         run: |
-          keytool -genkeypair -v -keystore "$PROJECT_DIR/debug.keystore" \
+          [ -f "$PROJECT_DIR/debug.keystore" ] || keytool -genkeypair -v -keystore "$PROJECT_DIR/debug.keystore" \
             -storepass android -keypass android -alias androiddebugkey \
             -keyalg RSA -keysize 2048 -validity 10000 \
             -dname "CN=Android Debug,O=Android,C=US"
-
-      - name: Build debug APK
-        working-directory: ${{ env.PROJECT_DIR }}
-        run: gradle assembleDebug --no-daemon --stacktrace
-
-      - name: Upload APK
-        uses: actions/upload-artifact@v4
-        with:
-          name: ISMAMINT-apk
-          path: ${{ env.PROJECT_DIR }}/app/build/outputs/apk/debug/*.apk
