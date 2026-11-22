@@ -36,3 +36,40 @@ jobs:
             -storepass android -keypass android -alias androiddebugkey \
             -keyalg RSA -keysize 2048 -validity 10000 \
             -dname "CN=Android Debug,O=Android,C=US"
+
+      - name: Guardar repo para actualizaciones automaticas
+        run: |
+          mkdir -p "$PROJECT_DIR/app/src/main/assets"
+          printf '%s' "${{ github.repository }}" > "$PROJECT_DIR/app/src/main/assets/update_repo.txt"
+
+      - name: Build debug APK
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: gradle assembleDebug --no-daemon --stacktrace -PappVersionCode=${{ github.run_number }} -PappVersionName=1.0.${{ github.run_number }}
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: ISMAMINT-apk
+          path: ${{ env.PROJECT_DIR }}/app/build/outputs/apk/debug/*.apk
+
+      - name: Publicar release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COMMIT_MSG: ${{ github.event.head_commit.message }}
+        run: |
+          cp "$PROJECT_DIR"/app/build/outputs/apk/debug/*.apk ismamint.apk
+          {
+            echo "Versión automática ${{ github.run_number }}."
+            echo ""
+            echo "Cambios:"
+            if [ -n "$COMMIT_MSG" ]; then
+              echo "$COMMIT_MSG"
+            else
+              echo "Compilación manual (sin mensaje de commit)."
+            fi
+          } > notes.md
+          gh release create "v${{ github.run_number }}" ismamint.apk \
+            --target "${{ github.sha }}" \
+            --title "ISMAMINT v${{ github.run_number }}" \
+            --notes-file notes.md \
+            --latest
