@@ -1,3 +1,4 @@
+
 name: Build APK
 
 on:
@@ -11,8 +12,11 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
+
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - uses: actions/setup-java@v4
         with:
@@ -23,53 +27,133 @@ jobs:
         with:
           gradle-version: 9.3.1
 
-      - name: Unzip project
+      - name: Detectar y extraer proyecto
+        shell: bash
         run: |
-          mkdir -p work
-          unzip -o -q ./*.zip -d work
-          SETTINGS=$(find work -name settings.gradle.kts | head -n 1)
-          echo "PROJECT_DIR=$(dirname "$SETTINGS")" >> $GITHUB_ENV
+          set -euo pipefail
 
-      - name: Create debug keystore (solo si el proyecto no trae una)
+          ZIP=""
+          NEWEST=0
+
+          while IFS= read -r -d '' FILE; do
+            case "$FILE" in
+              *.zip|*.ZIP)
+                TIMESTAMP=$(git log -1 --format=%ct -- "$FILE")
+                TIMESTAMP=${TIMESTAMP:-0}
+
+                if [ -z "$ZIP" ] || [ "$TIMESTAMP" -gt "$NEWEST" ]; then
+                  ZIP="$FILE"
+                  NEWEST="$TIMESTAMP"
+                fi
+                ;;
+            esac
+          done < <(git ls-files -z)
+
+          if [ -z "$ZIP" ]; then
+            echo "::error::No se encontró ningún archivo ZIP."
+            exit 1
+          fi
+
+          echo "ZIP seleccionado: $ZIP"
+
+          unzip -tq "$ZIP"
+
+          mkdir -p "$RUNNER_TEMP/ismamint-work"
+          unzip -o -q "$ZIP" -d "$RUNNER_TEMP/ismamint-work"
+
+          SETTINGS=$(find "$RUNNER_TEMP/ismamint-work" \
+            -type f -name settings.gradle.kts -print -quit)
+
+          if [ -z "$SETTINGS" ]; then
+            echo "::error::No se encontró settings.gradle.kts."
+            exit 1
+          fi
+
+          PROJECT_DIR=$(dirname "$SETTINGS")
+
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          echo "Proyecto detectado: $PROJECT_DIR"
+
+      - name: Create debug keystore
+        shell: bash
         run: |
-          [ -f "$PROJECT_DIR/debug.keystore" ] || keytool -genkeypair -v -keystore "$PROJECT_DIR/debug.keystore" \
-            -storepass android -keypass android -alias androiddebugkey \
-            -keyalg RSA -keysize 2048 -validity 10000 \
-            -dname "CN=Android Debug,O=Android,C=US"
+          if [ ! -f "$PROJECT_DIR/debug.keystore" ]; then
+            keytool -genkeypair -v \
+              -keystore "$PROJECT_DIR/debug.keystore" \
+              -storepass android \
+              -keypass android \
+              -alias androiddebugkey \
+              -keyalg RSA \
+              -keysize 2048 \
+              -validity 10000 \
+              -dname "CN=Android Debug,O=Android,C=US"
+          fi
 
       - name: Guardar repo para actualizaciones automaticas
         run: |
           mkdir -p "$PROJECT_DIR/app/src/main/assets"
-          printf '%s' "${{ github.repository }}" > "$PROJECT_DIR/app/src/main/assets/update_repo.txt"
+
+          printf '%s' "${{ github.repository }}" \
+            > "$PROJECT_DIR/app/src/main/assets/update_repo.txt"
 
       - name: Build debug APK
         working-directory: ${{ env.PROJECT_DIR }}
-        run: gradle assembleDebug --no-daemon --stacktrace -PappVersionCode=${{ github.run_number }} -PappVersionName=1.0.${{ github.run_number }}
+        run: |
+          gradle assembleDebug \
+            --no-daemon \
+            --stacktrace \
+            -PappVersionCode=${{ github.run_number }} \
+            -PappVersionName=1.0.${{ github.run_number }}
 
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: ISMAMINT-apk
           path: ${{ env.PROJECT_DIR }}/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
 
       - name: Publicar release
         env:
           GH_TOKEN: ${{ github.token }}
           COMMIT_MSG: ${{ github.event.head_commit.message }}
+        shell: bash
         run: |
-          cp "$PROJECT_DIR"/app/build/outputs/apk/debug/*.apk ismamint.apk
+          set -euo pipefail
+
+          APK=$(find "$PROJECT_DIR/app/build/outputs/apk/debug" \
+            -type f -name '*.apk' -print -quit)
+
+          if [ -z "$APK" ]; then
+            echo "::error::No se encontró el APK compilado."
+            exit 1
+          fi
+
+          cp "$APK" ismamint.apk
+
           {
             echo "Versión automática ${{ github.run_number }}."
             echo ""
             echo "Cambios:"
+
             if [ -n "$COMMIT_MSG" ]; then
               echo "$COMMIT_MSG"
             else
               echo "Compilación manual (sin mensaje de commit)."
             fi
           } > notes.md
-          gh release create "v${{ github.run_number }}" ismamint.apk \
-            --target "${{ github.sha }}" \
-            --title "ISMAMINT v${{ github.run_number }}" \
-            --notes-file notes.md \
-            --latest
+
+          TAG="v${{ github.run_number }}"
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" ismamint.apk --clobber
+
+            gh release edit "$TAG" \
+              --notes-file notes.md \
+              --latest
+          else
+            gh release create "$TAG" ismamint.apk \
+              --target "${{ github.sha }}" \
+              --title "ISMAMINT v${{ github.run_number }}" \
+              --notes-file notes.md \
+              --latest
+          fi
