@@ -1,26 +1,128 @@
+          ZIP=""
+          NEWEST=0
+
+          while IFS= read -r -d '' FILE; do
+            case "$FILE" in
+              *.zip|*.ZIP)
+                TIMESTAMP=$(git log -1 --format=%ct -- "$FILE")
+                TIMESTAMP=${TIMESTAMP:-0}
+                if [ -z "$ZIP" ] || [ "$TIMESTAMP" -gt "$NEWEST" ]; then
+                  ZIP="$FILE"
+                  NEWEST="$TIMESTAMP"
+                fi
+                ;;
+            esac
+          done < <(git ls-files -z)
+
+          if [ -z "$ZIP" ]; then
+            echo "::error::No se encontró ningún archivo ZIP."
+            exit 1
+          fi
+
+          echo "ZIP seleccionado: $ZIP"
+          unzip -tq "$ZIP"
+          mkdir -p "$RUNNER_TEMP/ismamint-work"
+          unzip -o -q "$ZIP" -d "$RUNNER_TEMP/ismamint-work"
+
+          SETTINGS=$(find "$RUNNER_TEMP/ismamint-work" \
+            -type f -name settings.gradle.kts -print -quit)
+          if [ -z "$SETTINGS" ]; then
+            echo "::error::No se encontró settings.gradle.kts."
+            exit 1
+          fi
+
+          PROJECT_DIR=$(dirname "$SETTINGS")
+          echo "PROJECT_DIR=$PROJECT_DIR" >> "$GITHUB_ENV"
+          echo "Proyecto detectado: $PROJECT_DIR"
+
+      - name: Create debug keystore
+        shell: bash
+        run: |
+          if [ ! -f "$PROJECT_DIR/debug.keystore" ]; then
+            keytool -genkeypair -v \
+              -keystore "$PROJECT_DIR/debug.keystore" \
+              -storepass android \
+              -keypass android \
+              -alias androiddebugkey \
+              -keyalg RSA \
+              -keysize 2048 \
+              -validity 10000 \
+              -dname "CN=Android Debug,O=Android,C=US"
+          fi
+
+      - name: Guardar repo para actualizaciones automaticas
+        run: |
+          mkdir -p "$PROJECT_DIR/app/src/main/assets"
+          printf '%s' "${{ github.repository }}" \
+            > "$PROJECT_DIR/app/src/main/assets/update_repo.txt"
+
       - name: Corregir incompatibilidad de NotificationHelper
         shell: bash
         run: |
           python3 - <<'PY'
           import os
+          import re
           from pathlib import Path
 
-          file = Path(os.environ["PROJECT_DIR"]) / \
-              "app/src/main/java/com/example/NotificationHelper.java"
+          file = Path(os.environ['PROJECT_DIR']) / 'app/src/main/java/com/example/NotificationHelper.java'
+          if not file.is_file():
+              print('NotificationHelper no existe; se omite el parche.')
+              raise SystemExit(0)
 
-          text = file.read_text(encoding="utf-8")
-
-          old = """if (timestampMillis <= now || expiresAtMillis <= now || expiresAtMillis < timestampMillis) {
-                      return false;
-                  }"""
-
-          new = """if (timestampMillis <= now || expiresAtMillis <= now || expiresAtMillis < timestampMillis) {
-                      return;
-                  }"""
-
-          if old in text:
-              file.write_text(text.replace(old, new), encoding="utf-8")
-              print("Incompatibilidad corregida.")
+          text = file.read_text(encoding='utf-8')
+          pattern = (r'(public\s+static\s+void\s+scheduleNotification\s*\(\s*Context\s+context,\s*int\s+id,\s*String\s+titulo,\s*String\s+texto,\s*long\s+timestampMillis,\s*long\s+expiresAtMillis\s*\)\s*\{\s*long\s+now\s*=\s*System\.currentTimeMillis\(\);\s*if\s*\(\s*timestampMillis\s*<=\s*now\s*\|\|\s*expiresAtMillis\s*<=\s*now\s*\|\|\s*expiresAtMillis\s*<\s*timestampMillis\s*\)\s*\{\s*)return\s+false\s*;')
+          patched, count = re.subn(pattern, r'\g<1>return;', text)
+          if count == 1:
+              file.write_text(patched, encoding='utf-8')
+              print('Incompatibilidad corregida.')
+          elif count == 0:
+              print('No se encontró el error conocido; se conserva el código.')
           else:
-              print("No es necesario aplicar el parche.")
+              raise SystemExit('Coincidencias inesperadas; no se aplica el parche.')
           PY
+
+      - name: Build debug APK
+        working-directory: ${{ env.PROJECT_DIR }}
+        run: |
+          gradle assembleDebug \
+            --no-daemon \
+            --stacktrace \
+            -PappVersionCode=${{ github.run_number }} \
+            -PappVersionName=1.0.${{ github.run_number }}
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: ISMAMINT-apk
+          path: ${{ env.PROJECT_DIR }}/app/build/outputs/apk/debug/*.apk
+          if-no-files-found: error
+
+      - name: Publicar release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          COMMIT_MSG: ${{ github.event.head_commit.message }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          APK=$(find "$PROJECT_DIR/app/build/outputs/apk/debug" \
+            -type f -name '*.apk' -print -quit)
+          if [ -z "$APK" ]; then
+            echo "::error::No se encontró el APK compilado."
+            exit 1
+          fi
+
+          cp "$APK" ismamint.apk
+          {
+            echo "Versión automática ${{ github.run_number }}."
+            echo ""
+            echo "Cambios:"
+            if [ -n "$COMMIT_MSG" ]; then
+              echo "$COMMIT_MSG"
+            else
+              echo "Compilación manual (sin mensaje de commit)."
+            fi
+          } > notes.md
+
+          TAG="v${{ github.run_number }}"
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" ismamint.apk --clobber
